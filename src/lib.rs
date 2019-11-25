@@ -1,3 +1,5 @@
+#![feature(backtrace)]
+
 //! An implementation of the GNU make jobserver.
 //!
 //! This crate is an implementation, in Rust, of the GNU `make` jobserver for
@@ -78,7 +80,7 @@
 #![deny(missing_docs, missing_debug_implementations)]
 #![doc(html_root_url = "https://docs.rs/jobserver/0.1")]
 
-use std::env;
+//use std::env;
 use std::io;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -201,27 +203,7 @@ impl Client {
     /// Note, though, that on Windows it should be safe to call this function
     /// any number of times.
     pub unsafe fn from_env() -> Option<Client> {
-        let var = match env::var("CARGO_MAKEFLAGS")
-            .or(env::var("MAKEFLAGS"))
-            .or(env::var("MFLAGS"))
-        {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-        let mut arg = "--jobserver-fds=";
-        let pos = match var.find(arg) {
-            Some(i) => i,
-            None => {
-                arg = "--jobserver-auth=";
-                match var.find(arg) {
-                    Some(i) => i,
-                    None => return None,
-                }
-            }
-        };
-
-        let s = var[pos + arg.len()..].split(' ').next().unwrap();
-        imp::Client::open(s).map(|c| Client { inner: Arc::new(c) })
+        imp::Client::open().map(|c| Client { inner: Arc::new(c) })
     }
 
     /// Acquires a token from this jobserver client.
@@ -266,11 +248,7 @@ impl Client {
     /// On platforms other than Unix and Windows this panics.
     pub fn configure(&self, cmd: &mut Command) {
         let arg = self.inner.string_arg();
-        // Older implementations of make use `--jobserver-fds` and newer
-        // implementations use `--jobserver-auth`, pass both to try to catch
-        // both implementations.
-        let value = format!("--jobserver-fds={0} --jobserver-auth={0}", arg);
-        cmd.env("CARGO_MAKEFLAGS", &value);
+        cmd.env("RUST_JOBSERVER", &arg);
         self.inner.configure(cmd);
     }
 
@@ -459,191 +437,159 @@ impl HelperState {
 mod imp {
     extern crate libc;
 
-    use std::fs::File;
-    use std::io::{self, Read, Write};
+    use std::io;
     use std::mem;
     use std::os::unix::prelude::*;
     use std::process::Command;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Once};
     use std::thread::{self, Builder, JoinHandle};
     use std::time::Duration;
 
     use self::libc::c_int;
 
-    #[derive(Debug)]
     pub struct Client {
-        read: File,
-        write: File,
+        id: u32,
+        semaphore: *mut self::libc::sem_t,
+        is_primary: bool,
     }
 
-    #[derive(Debug)]
-    pub struct Acquired {
-        byte: u8,
+    impl std::fmt::Debug for Client {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Client")
+                .field("id", &self.id)
+                .field("value", &self.value())
+                .field("primary", &self.is_primary)
+                .field("process", &std::env::args_os())
+                .field("location", &std::backtrace::Backtrace::force_capture())
+                .finish()
+        }
     }
+
+    // semaphores are MT-safe
+    unsafe impl Sync for Client {}
+    unsafe impl Send for Client {}
+
+    #[derive(Debug)]
+    pub struct Acquired;
 
     impl Client {
         pub fn new(limit: usize) -> io::Result<Client> {
-            let client = unsafe { Client::mk()? };
-            // I don't think the character written here matters, but I could be
-            // wrong!
-            for _ in 0..limit {
-                (&client.write).write(&[b'|'])?;
-            }
+            let client = unsafe { Client::mk(limit as u32)? };
             Ok(client)
         }
 
-        unsafe fn mk() -> io::Result<Client> {
-            let mut pipes = [0; 2];
+        unsafe fn mk(limit: u32) -> io::Result<Client> {
+            let mut st;
+            let mut i = 0;
+            loop {
+                let name = std::ffi::CString::new(format!("jobserver-rust-{}", i)).unwrap();
+                st = self::libc::sem_open(
+                    name.as_ptr(),
+                    self::libc::O_CREAT | self::libc::O_EXCL,
+                    0o664,
+                    limit,
+                );
 
-            // Attempt atomically-create-with-cloexec if we can on Linux,
-            // detected by using the `syscall` function in `libc` to try to work
-            // with as many kernels/glibc implementations as possible.
-            #[cfg(target_os = "linux")]
-            {
-                static PIPE2_AVAILABLE: AtomicBool = AtomicBool::new(true);
-                if PIPE2_AVAILABLE.load(Ordering::SeqCst) {
-                    match libc::syscall(libc::SYS_pipe2, pipes.as_mut_ptr(), libc::O_CLOEXEC) {
-                        -1 => {
-                            let err = io::Error::last_os_error();
-                            if err.raw_os_error() == Some(libc::ENOSYS) {
-                                PIPE2_AVAILABLE.store(false, Ordering::SeqCst);
-                            } else {
-                                return Err(err);
-                            }
-                        }
-                        _ => return Ok(Client::from_fds(pipes[0], pipes[1])),
+                if st == self::libc::SEM_FAILED {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        i += 1;
+                        continue;
                     }
+                    return Err(std::io::Error::last_os_error());
+                } else {
+                    break;
                 }
             }
 
-            cvt(libc::pipe(pipes.as_mut_ptr()))?;
-            drop(set_cloexec(pipes[0], true));
-            drop(set_cloexec(pipes[1], true));
-            Ok(Client::from_fds(pipes[0], pipes[1]))
+            Ok(Client {
+                semaphore: st,
+                id: i,
+                is_primary: true,
+            })
         }
 
-        pub unsafe fn open(s: &str) -> Option<Client> {
-            let mut parts = s.splitn(2, ',');
-            let read = parts.next().unwrap();
-            let write = match parts.next() {
-                Some(s) => s,
-                None => return None,
-            };
+        pub unsafe fn open() -> Option<Client> {
+            let id = std::env::var("RUST_JOBSERVER")
+                .ok()?
+                .parse::<u32>()
+                .unwrap();
+            let name = std::ffi::CString::new(format!("jobserver-rust-{}", id)).unwrap();
+            let st = self::libc::sem_open(name.as_ptr(), 0);
 
-            let read = match read.parse() {
-                Ok(n) => n,
-                Err(_) => return None,
-            };
-            let write = match write.parse() {
-                Ok(n) => n,
-                Err(_) => return None,
-            };
-
-            // Ok so we've got two integers that look like file descriptors, but
-            // for extra sanity checking let's see if they actually look like
-            // instances of a pipe before we return the client.
-            //
-            // If we're called from `make` *without* the leading + on our rule
-            // then we'll have `MAKEFLAGS` env vars but won't actually have
-            // access to the file descriptors.
-            if is_valid_fd(read) && is_valid_fd(write) {
-                drop(set_cloexec(read, true));
-                drop(set_cloexec(write, true));
-                Some(Client::from_fds(read, write))
-            } else {
-                None
+            if st == self::libc::SEM_FAILED {
+                return None;
             }
-        }
 
-        unsafe fn from_fds(read: c_int, write: c_int) -> Client {
-            Client {
-                read: File::from_raw_fd(read),
-                write: File::from_raw_fd(write),
-            }
+            Some(Client {
+                semaphore: st,
+                id,
+                is_primary: false,
+            })
         }
 
         pub fn acquire(&self) -> io::Result<Acquired> {
-            // We don't actually know if the file descriptor here is set in
-            // blocking or nonblocking mode. AFAIK all released versions of
-            // `make` use blocking fds for the jobserver, but the unreleased
-            // version of `make` doesn't. In the unreleased version jobserver
-            // fds are set to nonblocking and combined with `pselect`
-            // internally.
-            //
-            // Here we try to be compatible with both strategies. We
-            // unconditionally expect the file descriptor to be in nonblocking
-            // mode and if it happens to be in blocking mode then most of this
-            // won't end up actually being necessary!
-            //
-            // We use `poll` here to block this thread waiting for read
-            // readiness, and then afterwards we perform the `read` itself. If
-            // the `read` returns that it would block then we start over and try
-            // again.
-            //
-            // Also note that we explicitly don't handle EINTR here. That's used
-            // to shut us down, so we otherwise punt all errors upwards.
-            unsafe {
-                let mut fd: libc::pollfd = mem::zeroed();
-                fd.fd = self.read.as_raw_fd();
-                fd.events = libc::POLLIN;
-                loop {
-                    fd.revents = 0;
-                    if libc::poll(&mut fd, 1, -1) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if fd.revents == 0 {
+            loop {
+                let ret = unsafe { self::libc::sem_wait(self.semaphore) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
                         continue;
                     }
-                    let mut buf = [0];
-                    match (&self.read).read(&mut buf) {
-                        Ok(1) => return Ok(Acquired { byte: buf[0] }),
-                        Ok(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "early EOF on jobserver pipe",
-                            ))
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(e),
-                    }
+                    //eprintln!("acquire failed {:?}: {:?}", self, err);
+                    return Err(err);
                 }
+                //eprintln!("acquire success {:?}", self);
+                break;
+            }
+
+            Ok(Acquired)
+        }
+
+        fn value(&self) -> i32 {
+            unsafe {
+                let mut val = 0;
+                assert_eq!(libc::sem_getvalue(self.semaphore, &mut val), 0);
+                val
             }
         }
 
-        pub fn release(&self, data: Option<&Acquired>) -> io::Result<()> {
-            // Note that the fd may be nonblocking but we're going to go ahead
-            // and assume that the writes here are always nonblocking (we can
-            // always quickly release a token). If that turns out to not be the
-            // case we'll get an error anyway!
-            let byte = data.map(|d| d.byte).unwrap_or(b'+');
-            match (&self.write).write(&[byte])? {
-                1 => Ok(()),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "failed to write token back to jobserver",
-                )),
+        pub fn release(&self, _: Option<&Acquired>) -> io::Result<()> {
+            let ret = unsafe { self::libc::sem_post(self.semaphore) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                //eprintln!("release failed {:?}: {:?}", self, err);
+                return Err(err);
             }
+            //eprintln!("release success {:?}", self);
+
+            Ok(())
         }
 
         pub fn string_arg(&self) -> String {
-            format!("{},{} -j", self.read.as_raw_fd(), self.write.as_raw_fd())
+            format!("{}", self.id)
         }
 
-        pub fn configure(&self, cmd: &mut Command) {
-            // Here we basically just want to say that in the child process
-            // we'll configure the read/write file descriptors to *not* be
-            // cloexec, so they're inherited across the exec and specified as
-            // integers through `string_arg` above.
-            let read = self.read.as_raw_fd();
-            let write = self.write.as_raw_fd();
+        pub fn configure(&self, _: &mut Command) {
+            // nothing to do
+        }
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
             unsafe {
-                cmd.pre_exec(move || {
-                    set_cloexec(read, false)?;
-                    set_cloexec(write, false)?;
-                    Ok(())
-                });
+                // close our handle to the semaphore
+                self::libc::sem_close(self.semaphore);
+                if self.is_primary {
+                    // Destroy the (global) name of this semaphore; any
+                    // currently open handles to this semaphore can still
+                    // function as needed, but new ones with the same name will
+                    // refer to a different semaphore
+                    let name =
+                        std::ffi::CString::new(format!("jobserver-rust-{}", self.id)).unwrap();
+                    self::libc::sem_unlink(name.as_ptr());
+                }
             }
         }
     }
@@ -726,35 +672,6 @@ mod imp {
             if state.consumer_done {
                 drop(self.thread.join());
             }
-        }
-    }
-
-    fn is_valid_fd(fd: c_int) -> bool {
-        unsafe {
-            return libc::fcntl(fd, libc::F_GETFD) != -1;
-        }
-    }
-
-    fn set_cloexec(fd: c_int, set: bool) -> io::Result<()> {
-        unsafe {
-            let previous = cvt(libc::fcntl(fd, libc::F_GETFD))?;
-            let new = if set {
-                previous | libc::FD_CLOEXEC
-            } else {
-                previous & !libc::FD_CLOEXEC
-            };
-            if new != previous {
-                cvt(libc::fcntl(fd, libc::F_SETFD, new))?;
-            }
-            Ok(())
-        }
-    }
-
-    fn cvt(t: c_int) -> io::Result<c_int> {
-        if t == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(t)
         }
     }
 
@@ -1026,7 +943,7 @@ mod imp {
     }
 
     #[derive(Debug)]
-    pub struct Acquired(());
+    pub struct Acquired;
 
     impl Client {
         pub fn new(limit: usize) -> io::Result<Client> {
